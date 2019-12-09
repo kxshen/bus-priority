@@ -1,0 +1,38 @@
+---
+title: "11.S953: Bus Priority Measures"
+output: html_notebook
+---
+```{r}
+#Libraries...?
+library(tidytransit)
+library(tidyverse)
+library(leaflet)
+```
+
+# Import data
+First, start with one route, and compare average travel times before and after implementation
+
+Use GTFS to get (lat,long) for stop id's, and other things for the real map. 
+
+```{r}
+#GTFS
+mbta_gtfs = read_gtfs('data/MBTA_GTFS_Jan_2019.zip')#runtime is long on importing GTFS feed
+
+dat = read.csv(file = 'data/Broadway/R101_in.csv')
+
+#Find coordinates of important stops
+stopnames = dat %>% select(stopid) %>% unique()
+stops_cut = filter(mbta_gtfs$stops, as.numeric(stop_code) %in% stopnames$stopid)
+
+#map out the stops
+m = leaflet(stops_cut) %>% 
+  addTiles() %>% 
+  addMarkers(lng = ~stop_lon, lat = ~stop_lat)
+
+head(dat)
+```
+
+```{r}
+
+```
+
