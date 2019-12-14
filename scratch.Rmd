@@ -4,7 +4,8 @@ output: rmarkdown::github_document
 always_allow_html: true
 
 ---
-```{r}
+The purpose of this memo is in assessing the affectiveness of the recent bus priority measure implemented by the MBTA. 
+```{r include=FALSE}
 #Libraries...?
 library(tidytransit)
 library(tidyverse)
