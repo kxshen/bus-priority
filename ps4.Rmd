@@ -1,0 +1,520 @@
+---
+title: "11.S953: Bus Priority Measures -- 12/15/2019"
+output: 
+  #md_document: default
+  html_document:
+    toc: true #table of contents
+    toc_float: true
+    code_folding: hide #hide code blocks by default!
+    keep_md: yes
+always_allow_html: true
+---
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+```
+
+The purpose of this memo is in assessing the effectiveness of the recent bus priority measures implemented by the MBTA. 
+
+Internally, this assignment served me as an exploration of: tidytransit, leaflet, sf, tidyverse, and conversion to markdown. 
+```{r include=FALSE}
+#Libraries...?
+library(tidytransit)
+library(tidyverse)
+library(leaflet)
+library(lubridate)
+library(sf)
+library(geojsonsf)
+library(htmlwidgets)
+library(knitr)
+```
+
+# Import GTFS data with 'tidytransit'
+First, start with one route, and compare average travel times before and after implementation
+
+Use GTFS to get (lat,long) for stop id's, and other things for the real map. 
+```{r ImportGTFS, message=FALSE, warning=FALSE}
+mbta_gtfs = read_gtfs('data/MBTA_GTFS_Jan_2019.zip')#runtime is <5min  on importing GTFS feed
+summary(mbta_gtfs)
+```
+# Broadway Corridor
+This section investigates the Winter Hill neighborhood. The lanes have only been put in since October, and so comparable data is more scarce than the others. 
+```{r}
+#INPUT SECTION
+routes_study = c(89,101) #input routes to put on map
+dat89i = read.csv(file = 'data/Broadway/R89_in.csv')
+dat101i = read.csv(file = 'data/Broadway/R101_in.csv')
+dati = rbind(dat89i, dat101i)
+dat89o = read.csv(file = 'data/Broadway/R89_out.csv')
+dat101o = read.csv(file = 'data/Broadway/R101_out.csv')
+dato = rbind(dat89o, dat101o)
+dat = rbind(dati,dato) #merge all files, distinguished by route variable and direction variable. 
+```
+
+```{r warning = FALSE, message=FALSE}
+#Find coordinates of important stops
+stopnames = dat %>% select(stopid) %>% unique()
+stops_cut = filter(mbta_gtfs$stops, as.numeric(stop_code) %in% stopnames$stopid) %>% arrange(stop_lon)
+
+#recreate the methodology from class, but only display the better bus lanes and the corresponding stops
+geo1 = st_multipoint(cbind(stops_cut$stop_lon, stops_cut$stop_lat)) %>% st_sfc %>% st_sf# stop points
+selected_shape_ids = mbta_gtfs$trips %>% 
+  filter(as.numeric(route_id) %in% routes_study) %>% 
+  select(shape_id) %>% 
+  unique()
+selected_shapes = mbta_gtfs$shapes %>%
+  filter(shape_id %in% selected_shape_ids$shape_id) %>% 
+  arrange(shape_id, shape_pt_sequence)
+
+ls = vector("list", nrow(selected_shape_ids))
+for(i in 1:nrow(selected_shape_ids)){
+  ls[[i]] = selected_shapes %>% 
+    filter(shape_id == selected_shape_ids$shape_id[i]) %>% 
+    select(shape_pt_lon, shape_pt_lat) %>% 
+    as.matrix()
+}
+geo2 = st_multilinestring(ls) %>% st_sfc %>% st_sf # have to convert to geometry type, then feature collection for aggregation?
+
+geojson = rbind(geo1, geo2) %>% sf_geojson #combine features from different feature collections, finally!
+
+#abort mission, this part doesn't work as I intended
+# leaflet() %>% 
+#   addProviderTiles("CartoDB.Positron") %>% 
+#   addGeoJSON(geojson)
+
+m = leaflet(stops_cut) %>% 
+  addProviderTiles("CartoDB.Positron") %>% 
+  addCircleMarkers(lng = ~stop_lon, lat = ~stop_lat,
+    radius = 6,
+    color = "red",
+    stroke = FALSE, fillOpacity = 0.5,
+    popup = ~paste0("Stop: ", stop_id)
+  ) 
+for(group in 1:length(ls)){
+  m = m %>% addPolylines(
+                      lng= ~ shape_pt_lon,
+                      lat= ~ shape_pt_lat,
+                      data = as.data.frame(ls[[group]]), 
+                      #color= ~rainbow(length(ls))[group],
+                      weight = 3)
+}
+m
+withr::with_dir('results', saveWidget(m, file="broadway_map.html"))
+```
+In order to calculate the change in travel times induced by the implementation of the bus priority projects, we will use AVL data to calculate how long it took to get between two stops. 
+
+Since each bus route is different, we can calculate the difference in travel times between certain stops, but each combination of stops has different traffic characteristics. Therefore we will calculate the difference in running times for the following combinations, across all seasonal periods for which there are data (in this case, there is only one), as well ask by individual AM, PM, and Midday "peaks".
+See an outline of the area in "/ps4-bus-priority/results/broadway_map.html"
+
+* Inbound:
+    + Stop 5303 to 2709 (Route 101)
+    + Stop 2703 to 2709 (Route 89)
+    + Stop 2705 to 2709 (Both)
+* Outbound:
+    + Stop 2722 to 2729 (Both)
+    + Stop 2722 to 2725 (Both)
+    + Stop 2725 to 2729 (Both)
+
+## Travel Time Analyses
+We will create a generalized procedure to calculate travel times
+
+* Inputs: AVL files to be analyzed, specified starting and ending stops. 
+
+First, we must do some setup:
+```{r}
+endstops_combos = list(
+  #Inbound cases
+  c(5303, 2709),
+  c(2703, 2709),
+  c(2705, 2709),
+  #Outbound cases
+  c(2722, 2729),
+  c(2722, 2725),
+  c(2725, 2729)
+)
+
+#Classify into AM peak (1), midday (2), and PM peak (3) by defining bins
+timeclasses = matrix(
+  c("07:30:00", "09:30:00",
+  "12:00:00", "14:00:00", #gtfs uses 24 hr clock
+  "16:30:00", "18:30:00"),
+  nrow = 3, ncol = 2,
+  byrow = TRUE
+) %>% 
+  as.POSIXct(format = "%H:%M:%S") # creates POSIX object with today's date (just make sure it runs on the same day as the other)
+```
+
+```{r message=FALSE, results = 'hide'}
+#Convert data to datetime object for manipulation (subtraction)
+dat$actstoptime = dat$actstoptime %>% 
+  as.POSIXct()
+
+dat = dat %>% 
+  mutate(time = as.POSIXct(format(actstoptime,"%H%:%M:%S"), format = "%H:%M:%S")) %>% #first, extract time out of the datetime
+  mutate(peak = with(.,case_when( #case_when() is better than nested ifelse statements
+  (time > timeclasses[1] & time < timeclasses[4]) ~ 1,
+  (time > timeclasses[2] & time < timeclasses[5]) ~ 2,
+  (time > timeclasses[3] & time < timeclasses[6]) ~ 3,
+  TRUE ~ 0))) #all other trips are not analyzed
+
+results = vector(mode = "list", length = length(endstops_combos))
+for(case in 1:length(endstops_combos)){#loop through all cases, output results, runtime is not too long
+  endstops = endstops_combos[[case]]
+  triptimes = dat %>% 
+    group_by(trip) %>% 
+    filter(any(stopid %in% endstops[1]) & any(stopid %in% endstops[2])) %>% # look at length of interest: the full corridor
+    filter(any(peak > 0)) %>% 
+    summarise(travel_time = actstoptime[stopid == endstops[2]] - actstoptime[stopid == endstops[1]],
+          #calculate stoptime using the first and last stops
+              seasonal_period = unique(seasonal_period), 
+              implemented = unique(implemented),
+              peak = max(peak),
+              start = min(actstoptime))
+  results[[case]] = triptimes %>% 
+    group_by(seasonal_period, peak) %>% 
+    summarise(
+              mean_imp = median(travel_time[implemented == 1]), 
+              sd_imp = sd(travel_time[implemented == 1]),
+              mean_noimp = median(travel_time[implemented == 0]),
+              sd_noimp = sd(travel_time[implemented == 0]),
+              time_savings = median(travel_time[implemented == 0]) - median(travel_time[implemented == 1]),
+              sd_savings = sd(travel_time[implemented == 0]) - sd(travel_time[implemented == 1])
+              )
+  # I assume that peaks across days are comparable. Could be tested I guess. 
+}
+results
+```
+
+Generally, you can see a decrease in bus travel times due to the priority measures, which proves that these priority measures are effective (e.g. enforcement of bus only lanes is high). This effect is most pronounced for the highest congestion time, meaning the AM peak for inbound trips, and PM peak for outbound trips (Boston's commuting patterns are asymmetrical). Though the marginal travel time savings during other times is commendable, the most salient decreases in travel times are needed in the most congested trips, and this project is effective in decreasing that. 
+
+Furthermore, the variation of travel times is a highly impactful byproduct of congestion. The bus priority project generally decreases the variation in travel times, which is also an intended effect. 
+
+Depending on the AVL data provided, dates and recording may be messy. In this instance, the case of evaluating trip time changes for case 3 (2705 to 2709) was ineffective because there was no data collected after the project was implemented. Future estimation could involve an extrapolation using the longer travel times and finding the average proportion spent between 2705 and 2709. Further from a data standpoint, the long-term increase in Boston's congestion is not accounted for, and many other assumptions are made in order to maximize the amount of data avilable to make a rigorous comparison. 
+
+# Mt Auburn St
+The analysis was repeated for the other bus priority projects as well. 
+```{r}
+#INPUT SECTION
+routes_study = c(71,73) #input routes to put on map
+dat71i = read.csv(file = 'data/Mt Auburn St/R71_in.csv')
+dat73i = read.csv(file = 'data/Mt Auburn St/R73_in.csv')
+dati = rbind(dat71i, dat73i)
+dat71o = read.csv(file = 'data/Mt Auburn St/R71_out.csv')
+dat73o = read.csv(file = 'data/Mt Auburn St/R73_out.csv')
+dato = rbind(dat71o, dat73o)
+dat = rbind(dati,dato) #merge all files, distinguished by route variable and direction variable. 
+```
+
+```{r warning = FALSE}
+#Find coordinates of important stops
+stopnames = dat %>% select(stopid) %>% unique()
+stops_cut = filter(mbta_gtfs$stops, as.numeric(stop_code) %in% stopnames$stopid) %>% arrange(stop_lon)
+
+#recreate the methodology from class, but only display the better bus lanes and the corresponding stops
+geo1 = st_multipoint(cbind(stops_cut$stop_lon, stops_cut$stop_lat)) %>% st_sfc %>% st_sf# stop points
+selected_shape_ids = mbta_gtfs$trips %>% 
+  filter(as.numeric(route_id) %in% routes_study) %>% 
+  select(shape_id) %>% 
+  unique()
+selected_shapes = mbta_gtfs$shapes %>%
+  filter(shape_id %in% selected_shape_ids$shape_id) %>% 
+  arrange(shape_id, shape_pt_sequence)
+
+ls = vector("list", nrow(selected_shape_ids))
+for(i in 1:nrow(selected_shape_ids)){
+  ls[[i]] = selected_shapes %>% 
+    filter(shape_id == selected_shape_ids$shape_id[i]) %>% 
+    select(shape_pt_lon, shape_pt_lat) %>% 
+    as.matrix()
+}
+geo2 = st_multilinestring(ls) %>% st_sfc %>% st_sf # have to convert to geometry type, then feature collection for aggregation?
+
+geojson = rbind(geo1, geo2) %>% sf_geojson #combine features from different feature collections, finally!
+
+#abort mission, this part doesn't work as I intended
+# leaflet() %>% 
+#   addProviderTiles("CartoDB.Positron") %>% 
+#   addGeoJSON(geojson)
+
+m = leaflet(stops_cut) %>% 
+  addProviderTiles("CartoDB.Positron") %>% 
+  addCircleMarkers(lng = ~stop_lon, lat = ~stop_lat,
+    radius = 6,
+    color = "red",
+    stroke = FALSE, fillOpacity = 0.5,
+    popup = ~paste0("Stop: ", stop_id)
+  ) 
+for(group in 1:length(ls)){
+  m = m %>% addPolylines(
+                      lng= ~ shape_pt_lon,
+                      lat= ~ shape_pt_lat,
+                      data = as.data.frame(ls[[group]]), 
+                      #color= ~rainbow(length(ls))[group],
+                      weight = 3)
+}
+m
+withr::with_dir('results', saveWidget(m, file="mt_auburn_map.html"))
+```
+
+## Travel Time Analysis
+We test the following possible cases:
+
+* Inbound: 
+  + 2062-2068
+  + 2117-2068
+  + 2062-2066
+  + 2117-2066
+  + 2066-2068
+* Outbound
+  + 2026-2032
+  + 2026-2118
+  + 2028-2032
+  + 2028-2118
+  + 2026-2028
+
+```{r}
+endstops_combos = list(
+  #Inbound cases
+  c(2062, 2068),
+  c(2117, 2068),
+  c(2062, 2066),
+  c(2117, 2066),
+  c(2066, 2068),
+  #Outbound cases
+  c(2026, 2032),
+  c(2026, 2118),
+  c(2028, 2032), 
+  c(2028, 2118),
+  c(2026, 2028)
+)
+```
+
+```{r echo = FALSE, results = 'hide'}
+#Convert data to datetime object for manipulation (subtraction)
+dat$actstoptime = dat$actstoptime %>% 
+  as.POSIXct()
+
+dat = dat %>% 
+  mutate(time = as.POSIXct(format(actstoptime,"%H%:%M:%S"), format = "%H:%M:%S")) %>% #first, extract time out of the datetime
+  mutate(peak = with(.,case_when( #case_when() is better than nested ifelse statements
+  (time > timeclasses[1] & time < timeclasses[4]) ~ 1,
+  (time > timeclasses[2] & time < timeclasses[5]) ~ 2,
+  (time > timeclasses[3] & time < timeclasses[6]) ~ 3,
+  TRUE ~ 0))) #all other trips are not analyzed
+
+results2 = vector(mode = "list", length = length(endstops_combos))
+for(case in 1:length(endstops_combos)){#loop through all cases, output results, runtime is not too long
+  endstops = endstops_combos[[case]]
+  triptimes = dat %>% 
+    group_by(trip) %>% 
+    filter(any(stopid %in% endstops[1]) & any(stopid %in% endstops[2])) %>% # look at length of interest: the full corridor
+    filter(any(peak > 0)) %>% 
+    summarise(travel_time = actstoptime[stopid == endstops[2]] - actstoptime[stopid == endstops[1]],
+          #calculate stoptime using the first and last stops
+              seasonal_period = unique(seasonal_period), 
+              implemented = unique(implemented),
+              peak = max(peak),
+              start = min(actstoptime)) %>% 
+    filter(travel_time > 0) #some bad data to be taken out with negative travel times
+  results2[[case]] = triptimes %>% 
+    group_by(seasonal_period, peak) %>% 
+    summarise(
+              mean_imp = median(travel_time[implemented == 1]), 
+              sd_imp = sd(travel_time[implemented == 1]),
+              #n_imp = sum(implemented==1), #check for high sd because lack of samples?
+              mean_noimp = median(travel_time[implemented == 0]),
+              sd_noimp = sd(travel_time[implemented == 0]),
+              time_savings = median(travel_time[implemented == 0]) - median(travel_time[implemented == 1]),
+              sd_savings = sd(travel_time[implemented == 0]) - sd(travel_time[implemented == 1])
+              #n_noimp = sum(implemented == 0)
+              )
+  # I assume that peaks across days are comparable. Could be tested I guess. 
+}
+results2
+```
+
+
+
+# South Mass Ave
+Since the project is much more straightforward in this case, we only consider two wide-scale cases. Also it is noted that the priority changes are only present in the inbound direction. 
+```{r}
+#INPUT SECTION
+routes_study = c(1) #input routes to put on map
+dat1i = read.csv(file = 'data/South Mass Ave/R1_in.csv')
+#dat73i = read.csv(file = 'data/Mt Auburn St/R73_in.csv')
+dati = rbind(dat1i)
+dat1o = read.csv(file = 'data/South Mass Ave/R1_out.csv')
+#dat73o = read.csv(file = 'data/Mt Auburn St/R73_out.csv')
+dato = rbind(dat1o)
+dat = rbind(dati,dato) #merge all files, distinguished by route variable and direction variable. 
+```
+
+```{r}
+#Find coordinates of important stops
+stopnames = dat %>% select(stopid) %>% unique()
+stops_cut = filter(mbta_gtfs$stops, as.numeric(stop_code) %in% stopnames$stopid) %>% arrange(stop_lon)
+
+#recreate the methodology from class, but only display the better bus lanes and the corresponding stops
+geo1 = st_multipoint(cbind(stops_cut$stop_lon, stops_cut$stop_lat)) %>% st_sfc %>% st_sf# stop points
+selected_shape_ids = mbta_gtfs$trips %>% 
+  filter(as.numeric(route_id) %in% routes_study) %>% 
+  select(shape_id) %>% 
+  unique()
+selected_shapes = mbta_gtfs$shapes %>%
+  filter(shape_id %in% selected_shape_ids$shape_id) %>% 
+  arrange(shape_id, shape_pt_sequence)
+
+ls = vector("list", nrow(selected_shape_ids))
+for(i in 1:nrow(selected_shape_ids)){
+  ls[[i]] = selected_shapes %>% 
+    filter(shape_id == selected_shape_ids$shape_id[i]) %>% 
+    select(shape_pt_lon, shape_pt_lat) %>% 
+    as.matrix()
+}
+geo2 = st_multilinestring(ls) %>% st_sfc %>% st_sf # have to convert to geometry type, then feature collection for aggregation?
+
+geojson = rbind(geo1, geo2) %>% sf_geojson #combine features from different feature collections, finally!
+
+#abort mission, this part doesn't work as I intended
+# leaflet() %>% 
+#   addProviderTiles("CartoDB.Positron") %>% 
+#   addGeoJSON(geojson)
+
+m = leaflet(stops_cut) %>% 
+  addProviderTiles("CartoDB.Positron") %>% 
+  addCircleMarkers(lng = ~stop_lon, lat = ~stop_lat,
+    radius = 6,
+    color = "red",
+    stroke = FALSE, fillOpacity = 0.5,
+    popup = ~paste0("Stop: ", stop_id)
+  ) 
+for(group in 1:length(ls)){
+  m = m %>% addPolylines(
+                      lng= ~ shape_pt_lon,
+                      lat= ~ shape_pt_lat,
+                      data = as.data.frame(ls[[group]]), 
+                      #color= ~rainbow(length(ls))[group],
+                      weight = 3)
+}
+m
+withr::with_dir('results', saveWidget(m, file="south_mass_map.html"))
+```
+
+## Travel Time Analysis
+```{r}
+endstops_combos = list(
+  #Inbound case (only count aggregate this time...)
+  c(72,77),
+  #Outbound cases
+  c(95,102)
+)
+```
+
+```{r echo=FALSE, results = 'hide'}
+#Convert data to datetime object for manipulation (subtraction)
+dat$actstoptime = dat$actstoptime %>% 
+  as.POSIXct()
+
+dat = dat %>% 
+  mutate(time = as.POSIXct(format(actstoptime,"%H%:%M:%S"), format = "%H:%M:%S")) %>% #first, extract time out of the datetime
+  mutate(peak = with(.,case_when( #case_when() is better than nested ifelse statements
+  (time > timeclasses[1] & time < timeclasses[4]) ~ 1,
+  (time > timeclasses[2] & time < timeclasses[5]) ~ 2,
+  (time > timeclasses[3] & time < timeclasses[6]) ~ 3,
+  TRUE ~ 0))) #all other trips are not analyzed
+
+results3 = vector(mode = "list", length = length(endstops_combos))
+for(case in 1:length(endstops_combos)){#loop through all cases, output results, runtime is not too long
+  endstops = endstops_combos[[case]]
+  triptimes = dat %>% 
+    group_by(trip) %>% 
+    filter(any(stopid %in% endstops[1]) & any(stopid %in% endstops[2])) %>% # look at length of interest: the full corridor
+    filter(any(peak > 0)) %>% 
+    summarise(travel_time = actstoptime[stopid == endstops[2]] - actstoptime[stopid == endstops[1]],
+          #calculate stoptime using the first and last stops
+              seasonal_period = unique(seasonal_period), 
+              implemented = unique(implemented),
+              peak = max(peak),
+              start = min(actstoptime)) %>% 
+    filter(travel_time > 0) #some bad data to be taken out with negative travel times
+  results3[[case]] = triptimes %>% 
+    group_by(seasonal_period, peak) %>% 
+    summarise(
+              mean_imp = median(travel_time[implemented == 1]), 
+              sd_imp = sd(travel_time[implemented == 1]),
+              mean_noimp = median(travel_time[implemented == 0]),
+              sd_noimp = sd(travel_time[implemented == 0]),
+              time_savings = median(travel_time[implemented == 0]) - median(travel_time[implemented == 1]),
+              sd_savings = sd(travel_time[implemented == 0]) - sd(travel_time[implemented == 1])
+              )
+  # I assume that peaks across days are comparable. Could be tested I guess. 
+}
+results3
+```
+This project was only implemented in the inbound case (1), which manifests quite clearly in the time_savings and sd_savings columns. However, within the PM peak, where this route is most congested, travel times and reliability feel no different. This nicely pairs with the outbound case, where the direction of travel times seems to be quite random. 
+
+# Travel Time Summary
+To summarize, we take the broadest cases in each analysis above to describe the system-level changes in travel times and reliability. 
+```{r table2, echo=FALSE, message=FALSE, warnings=FALSE, results='asis'}
+sumtable = data.frame(matrix(nrow = 6, ncol = 4))
+names(sumtable) = c("Corridor", "Direction", "Median Savings (+ is good)", "SD Savings (+ is good)")
+sumtable$Corridor = c("Broadway", "Broadway", "Mt. Auburn St", "Mt. Auburn St", "South Mass Ave", "South Mass Ave")
+sumtable$Direction = c("Inbound", "Outbound", "Inbound", "Outbound", "Inbound", "Outbound")
+
+#Fill out median diff's
+sumtable[1,3] = mean(rbind(results[[1]]$time_savings, results[[2]]$time_savings), na.rm = TRUE)#case 1 and 2 in results, assumes that those stops are comparable (which they are, in distance, but with traffic light assumed to be negligible)
+sumtable[2,3] = mean(rbind(results[[4]]$time_savings), na.rm = TRUE)#case 4 covers whole corridor
+sumtable[3,3] = mean(rbind(results2[[1]]$time_savings, results2[[2]]$time_savings), na.rm = TRUE)#make same assumption as (1) about comparability
+sumtable[4,3] = mean(rbind(results2[[6]]$time_savings, results2[[7]]$time_savings), na.rm = TRUE)#make same assumption as (1) and (3) about comparability
+sumtable[5,3] = mean(rbind(results3[[1]]$time_savings), na.rm = TRUE)#case 1 covers whole corridor
+sumtable[6,3] = mean(rbind(results3[[2]]$time_savings), na.rm = TRUE)#case 2 covers whole corridor
+
+#Fill out sd diff's. Have to manual fill because of case judgement
+sumtable[1,4] = mean(rbind(results[[1]]$sd_savings, results[[2]]$sd_savings), na.rm = TRUE)
+sumtable[2,4] = mean(rbind(results[[4]]$sd_savings), na.rm = TRUE)
+sumtable[3,4] = mean(rbind(results2[[1]]$sd_savings, results2[[2]]$sd_savings), na.rm = TRUE)
+sumtable[4,4] = mean(rbind(results2[[6]]$sd_savings, results2[[7]]$sd_savings), na.rm = TRUE)
+sumtable[5,4] = mean(rbind(results3[[1]]$sd_savings), na.rm = TRUE)
+sumtable[6,4] = mean(rbind(results3[[2]]$sd_savings), na.rm = TRUE)
+
+kable(sumtable, caption = "Bus Priority Program Effect Summary")
+```
+
+# Mt Auburn Operational Implications
+## Route 71
+Using a rough simplification, the Mt. Auburn corridor shaved off 1.4 min on the inbound and 0.4 min on the outbound trips this reduces the running time needed. The SD is also decreased by around 0.6 on the inbound and 0.1 on the outbound. This can reduce the designed recovery time. Using this as an example, let's look at the rough vehicle scheduling plan for route 71:
+$$c_{71} = t_1 + r_1 + t_2 + r_2 = 63 min$$
+$$n_v = ceiling(\frac{c}{h}); n_v = 9 \rightarrow 8<\frac{63}{h} \leq9 \rightarrow 7 \leq h < 7.875$$
+To guess, this headway is probably chosen as 7.5min. With the new bus priority project, the cycle time changes, meaning that the agency can potentially change headways or required vehicles. 1.96*$\Delta$standard deviation gives the 95% percentile. 
+$$c_{71,new} = c_{71} + \Delta c_{71} = 63 - 1.4 - 0.4 - 1.96*0.6 - 1.96*0.1 = 59.8 \approx 60 $$
+Being at a 60 minute cycle time allows for intuitive combinations of headways and bus numbers. In this case, incremental changes in headways would not result in a noticeable change in service. However, the route can now use _8_ buses instead of 9, which could potentially cut many costs and allocate elsewhere. This takes advantage of a local optimum that happens due to the discrete number of buses. 
+$$\boxed{7<\frac{60}{h} \leq8\rightarrow 7.5 \leq h < 8.6}$$
+## Route 73
+A similar analysis can be done for route 73. 
+$$11 < \frac{72}{h} \leq 12 \rightarrow 6 \leq h < 6.55$$
+With 6 as a nice round number that can also work with hour-based schedules, and also the fact that it makes the most use of the 12 buses, headways are likely to be set at 6 minutes. 
+
+The bus priority project shaves off the same 3.2 minutes as in route 71, leading $c_{73,new} = 68.8min$. Keeping the same amount of vehicles, headways would not be able to change much, and would be practically unnoticed to the riders. 
+$$11 < \frac{68.8}{h} \leq 12 \rightarrow 5.73 \leq h < 6.25$$
+If a bus was cut from the service, headways would have to change above 6 minutes. In the given interval below, headways are even more asynchronous with the rest of the system. Cutting buses would be ill-advised. 
+$$10 < \frac{68.8}{h} \leq 11 \rightarrow 6.25 \leq h < 6.88$$
+Overall, the effect of the bus priority measures on route 73 would have no profound affect on the operations side. It would still have a benefit to the rider's experience though.
+
+#Open source contribution
+Though not much, during these coding adventures I finally contributed to a Github issue. Many workarounds to function malfunctions are not so intuitive for me, or too long, so I added my own here, credit to some other disparate source. In doing so I'm now registered for the non-Enterprise Github as well. 
+https://github.com/ramnathv/htmlwidgets/issues/299
+
+#Appendix: Individual case outputs
+##Broadway corridor:
+```{r}
+results
+```
+
+##Mt. Auburn St:
+```{r}
+results2
+```
+
+##South Mass Ave:
+```{r}
+results3
+```
